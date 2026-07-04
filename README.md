@@ -87,10 +87,43 @@ Fallback to Brent's method when:
 - Newton step produces a negative or > 5 sigma trial value
 - Iteration count exceeds the configured maximum
 
+### Error Handling: Two-Tier API (noexcept grid path, throwing scalar path)
+
+Every pricing module exposes two entry points:
+
+- **`try_*` (noexcept, status-returning):** returns a result struct carrying
+  the numeric payload plus an `ope::Status` (`Ok`, `BadInput`,
+  `NoConvergence`, `Unresolvable`). On any non-Ok status the numeric fields
+  are quiet NaN, never zero, so an ignored failure cannot masquerade as a
+  valid flat price. This is the **only** entry point the parallel Greeks grid
+  is permitted to call.
+- **Throwing wrappers** (`price_and_greeks`, scalar accessors): thin
+  convenience layers for scalar and interactive use that convert a non-Ok
+  status into `std::domain_error`.
+
+The split is not stylistic. Under the C++17 parallel algorithms, an exception
+that escapes the element callable calls `std::terminate`
+([algorithms.parallel.exceptions]); it cannot be caught around the algorithm.
+A throwing pricer inside `std::execution::par` therefore turns one malformed
+quote into a dead process. This was verified empirically: a 1,000-option grid
+with a single `sigma = -1` row aborted with SIGABRT under the old throwing
+API, and completes with exactly one `BadInput` row flagged under the
+status API.
+
+Input validation rejects non-finite values (`std::isfinite` on S, K, T, r,
+sigma) in addition to domain checks (S > 0, K > 0, T >= 0, sigma >= 0). NaN
+and infinity are checked explicitly because ordinary comparisons let them
+slip through: `inf > 0` is true, and an unchecked NaN rate prices silently
+to NaN.
+
+Shared types (`OptionType`, `Greeks`, `Status`, `PricingResult`) live in
+`types.hpp` so the tree, Monte Carlo, and IV modules use one error channel.
+
 ### Parallelization
 
 Greeks across a 3D option grid (strike x maturity x vol) are computed using
-`std::for_each` with `std::execution::par`.
+`std::for_each` with `std::execution::par`, calling the noexcept
+`try_price_and_greeks` path (see Error Handling above).
 
 `par` (not `par_unseq`) is the correct policy here. The per-element work is a
 full option repricing, which allocates working buffers (tree arrays, Monte Carlo
@@ -111,6 +144,7 @@ optimization noted as future work.
 ```
 options-pricing-engine/
 ├── include/
+│   ├── types.hpp                # Shared types: OptionType, Greeks, Status, PricingResult
 │   ├── black_scholes.hpp        # Closed-form pricer and Greeks
 │   ├── binomial_tree.hpp        # CRR tree, European and American
 │   ├── monte_carlo.hpp          # GBM simulation, antithetic variates, CRN Greeks
@@ -269,6 +303,15 @@ AAD-enabled forks.
 
 ## Known Limitations
 
+- **Deep-wing precision floor applies to the price formula, not just IV.**
+  The B-S price is formed as `omega * (S*N(omega*d1) - K*exp(-rT)*N(omega*d2))`.
+  For deep out-of-the-money options both terms are tiny and nearly cancel:
+  absolute error stays near machine epsilon, but relative error grows as the
+  price shrinks (a 5-sigma OTM call prices at ~1e-21). The IV solver's
+  documented wing failures are this same double-precision floor seen from the
+  inversion side. Jaeckel's "Let's Be Rational" formulation of the Black
+  function is the production fix for both, and remains the documented
+  upgrade path.
 - **No dividends.** Continuous dividend yield can be incorporated into B-S by
   replacing `r` with `r - q`. Discrete dividends require tree adjustment or
   jump conditions in the PDE. Not implemented.
@@ -360,3 +403,20 @@ This spec was revised to correct technical errors in the prior draft. Changes:
    vanilla European payoff is wasted work since the GBM terminal price is exactly
    lognormal. The multi-step engine is retained explicitly for path-dependent
    payoffs on the roadmap.
+7. **Two-tier error API introduced; throwing pricer removed from the grid
+   path.** The prior design had `validate()` throw `std::domain_error`
+   unconditionally. An exception escaping the element callable of a C++17
+   parallel algorithm calls `std::terminate`, so one bad row killed the whole
+   grid (verified: SIGABRT on a 1,000-option grid with a single bad sigma).
+   `try_price_and_greeks()` is now the noexcept, status-returning grid entry
+   point; the throwing API remains as a scalar convenience wrapper. Shared
+   types promoted to `types.hpp`.
+8. **Input validation hardened to reject non-finite values.** The prior
+   `!(x > 0)` comparisons rejected NaN for S/K/T/sigma but left `r` entirely
+   unchecked (NaN rate priced silently to NaN) and accepted infinities for
+   every field (`inf > 0` is true). All five inputs now require
+   `std::isfinite` in addition to the domain checks.
+9. **Deep-wing cancellation documented on the pricing side.** The limitation
+   was previously framed as an IV solver issue only. It is the same
+   double-precision floor in the price formula itself, and is now listed
+   under Known Limitations with the Jaeckel formulation as the shared fix.

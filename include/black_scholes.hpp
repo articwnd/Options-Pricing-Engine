@@ -8,6 +8,16 @@
 // Header-only, inline definitions (this pricer sits on the hot path of the
 // parallel Greeks grid, so cross-translation-unit inlinability matters).
 //
+// Error handling (two-tier, see types.hpp for rationale):
+//   - try_price_and_greeks() : noexcept, returns PricingResult{greeks, status}.
+//     This is the ONLY entry point the parallel Greeks grid may call. An
+//     exception escaping the element callable of a C++17 parallel algorithm
+//     calls std::terminate; a throwing pricer inside std::execution::par
+//     turns one bad quote into a dead process.
+//   - price_and_greeks() and the scalar accessors: throwing convenience
+//     wrappers for scalar / interactive use. They convert a non-Ok status
+//     into std::domain_error.
+//
 // Conventions (raw mathematical derivatives; caller scales for quoting):
 //   - vega  : per unit volatility            (NOT per 1%; divide by 100 to quote)
 //   - theta : dV/dt, per year                (NOT per day; divide by 365 or 252)
@@ -18,44 +28,39 @@
 // Assumptions / scope:
 //   - No dividends (q = 0). Continuous yield can later be added by replacing
 //     r with (r - q) in d1/d2 and discounting the spot leg by e^{-qT}.
-//   - Flat, continuously compounded risk-free rate r (any real value; negative
-//     rates are permitted).
+//   - Flat, continuously compounded risk-free rate r (any finite real value;
+//     negative rates are permitted).
 //   - C++17 floor. std::erf/std::exp are NOT constexpr before C++26 (P1383R2),
 //     so these functions are runtime (inline, noexcept where they cannot throw),
 //     not constexpr.
 //
-// NOTE: OptionType and Greeks are defined here for now. When the binomial tree
-// and Monte Carlo modules are added they should share these types; consider
-// promoting OptionType (and possibly Greeks) to a common "types.hpp" then.
+// Numerical precision floor (deep wings):
+//   The price is formed as omega * (S*N(omega*d1) - K*e^{-rT}*N(omega*d2)).
+//   For deep out-of-the-money options both terms are tiny and nearly cancel:
+//   absolute error stays near machine epsilon, but RELATIVE error grows as
+//   the price shrinks toward the underflow regime (e.g. a 5-sigma OTM call
+//   prices at ~1e-21). This is the same double-precision floor documented for
+//   the IV solver in implied_vol.hpp, seen from the pricing side. It is a
+//   property of the formulation, not a bug; Jaeckel's "Let's Be Rational"
+//   formulation of the Black function is the production fix for both ends.
 // ============================================================================
 
-#include <cmath>      // std::erfc, std::exp, std::log, std::sqrt
+#include <cmath>      // std::erfc, std::exp, std::log, std::sqrt, std::isfinite
 #include <stdexcept>  // std::domain_error
+#include <string>     // std::string (exception message assembly)
+
+#include "types.hpp"  // OptionType, Greeks, Status, PricingResult
 
 namespace ope {
 
-enum class OptionType { Call, Put };
-
 // All inputs for a single European option.
 struct BsInputs {
-    double S;            // spot price,                must be > 0
-    double K;            // strike price,              must be > 0
-    double T;            // time to expiry in years,   must be >= 0
-    double r;            // risk-free rate (cont. comp.), any real
-    double sigma;        // annualized volatility,     must be >= 0
+    double S;            // spot price,                must be > 0 and finite
+    double K;            // strike price,              must be > 0 and finite
+    double T;            // time to expiry in years,   must be >= 0 and finite
+    double r;            // risk-free rate (cont. comp.), any FINITE real
+    double sigma;        // annualized volatility,     must be >= 0 and finite
     OptionType type;
-};
-
-// Price plus first- and second-order Greeks. See header conventions for units.
-struct Greeks {
-    double price;
-    double delta;        // dV/dS                       (first order)
-    double gamma;        // d2V/dS2                      (second order)
-    double vega;         // dV/dSigma, per unit vol      (first order)
-    double theta;        // dV/dt, per year              (first order)
-    double rho;          // dV/dr, per unit rate         (first order)
-    double vanna;        // d2V/dS dSigma                (second order)
-    double volga;        // d2V/dSigma2 (vomma)          (second order)
 };
 
 namespace detail {
@@ -83,27 +88,43 @@ inline double omega_of(OptionType t) noexcept {
     return (t == OptionType::Call) ? 1.0 : -1.0;
 }
 
-// Throws std::domain_error on any input outside the model's valid domain.
-// Note the comparisons are written so that NaN inputs also fail (NaN > 0 is
-// false), rather than silently propagating.
-inline void validate(const BsInputs& in) {
-    if (!(in.S > 0.0))      throw std::domain_error("black_scholes: spot S must be > 0");
-    if (!(in.K > 0.0))      throw std::domain_error("black_scholes: strike K must be > 0");
-    if (!(in.T >= 0.0))     throw std::domain_error("black_scholes: time T must be >= 0");
-    if (!(in.sigma >= 0.0)) throw std::domain_error("black_scholes: sigma must be >= 0");
+// Domain check, noexcept. Returns Status::Ok or Status::BadInput.
+//
+// Two layers of defense:
+//   1. std::isfinite on every double rejects NaN AND +/-inf. The previous
+//      revision's `!(x > 0)` trick rejected NaN for S/K/T/sigma but let
+//      NaN r through unchecked (silently pricing to NaN) and accepted
+//      infinities everywhere (inf > 0 is true), producing garbage output.
+//   2. The domain comparisons proper (S > 0, K > 0, T >= 0, sigma >= 0).
+inline Status validate(const BsInputs& in) noexcept {
+    if (!std::isfinite(in.S) || !std::isfinite(in.K) || !std::isfinite(in.T) ||
+        !std::isfinite(in.r) || !std::isfinite(in.sigma)) {
+        return Status::BadInput;
+    }
+    if (!(in.S > 0.0))      return Status::BadInput;
+    if (!(in.K > 0.0))      return Status::BadInput;
+    if (!(in.T >= 0.0))     return Status::BadInput;
+    if (!(in.sigma >= 0.0)) return Status::BadInput;
+    return Status::Ok;
 }
 
 }  // namespace detail
 
 // ----------------------------------------------------------------------------
-// Full price + Greeks in a single pass.
+// try_price_and_greeks: noexcept, status-returning. The grid entry point.
 //
-// d1, d2, and phi(d1) are computed once and reused across every Greek, which is
-// materially cheaper than calling the individual accessors (each of which
-// recomputes those shared terms). Prefer this in any loop.
+// Full price + Greeks in a single pass. d1, d2, and phi(d1) are computed once
+// and reused across every Greek, which is materially cheaper than calling the
+// individual accessors (each of which recomputes those shared terms).
+//
+// On BadInput the returned Greeks are all quiet NaN (never zero), so a caller
+// that ignores the status cannot mistake a failure for a valid flat price.
 // ----------------------------------------------------------------------------
-inline Greeks price_and_greeks(const BsInputs& in) {
-    detail::validate(in);
+inline PricingResult try_price_and_greeks(const BsInputs& in) noexcept {
+    const Status st = detail::validate(in);
+    if (st != Status::Ok) {
+        return PricingResult{nan_greeks(), st};
+    }
 
     const double S     = in.S;
     const double K     = in.K;
@@ -136,7 +157,7 @@ inline Greeks price_and_greeks(const BsInputs& in) {
         g.rho   = itm ? ( omega * K * T * disc) : 0.0;  // lim of full rho
         g.vanna = 0.0;
         g.volga = 0.0;
-        return g;
+        return PricingResult{g, Status::Ok};
     }
 
     // ---- Standard branch ----------------------------------------------------
@@ -157,15 +178,32 @@ inline Greeks price_and_greeks(const BsInputs& in) {
     g.vanna = -pdf * d2 / sigma;                        // dVega/dSpot
     g.volga = g.vega * d1 * d2 / sigma;                 // dVega/dVol (vomma)
 
-    return g;
+    return PricingResult{g, Status::Ok};
 }
 
 // ----------------------------------------------------------------------------
-// Convenience scalar accessors.
+// Throwing convenience wrapper for scalar / interactive use.
+//
+// NEVER call this (or the scalar accessors below) as the element function of a
+// parallel algorithm: an exception escaping that callable is std::terminate,
+// not a catchable error. Use try_price_and_greeks() there.
+// ----------------------------------------------------------------------------
+inline Greeks price_and_greeks(const BsInputs& in) {
+    const PricingResult res = try_price_and_greeks(in);
+    if (!res.ok()) {
+        throw std::domain_error(std::string("black_scholes: ") +
+                                to_string(res.status) +
+                                " (S>0, K>0, T>=0, sigma>=0, all finite)");
+    }
+    return res.greeks;
+}
+
+// ----------------------------------------------------------------------------
+// Convenience scalar accessors (throwing).
 //
 // Each recomputes the shared terms internally, so calling several of these for
-// the same option is wasteful. Use price_and_greeks() when you need more than
-// one quantity (especially inside the parallel Greeks grid).
+// the same option is wasteful. Use price_and_greeks() (scalar) or
+// try_price_and_greeks() (grids) when you need more than one quantity.
 // ----------------------------------------------------------------------------
 inline double price(const BsInputs& in) { return price_and_greeks(in).price; }
 inline double delta(const BsInputs& in) { return price_and_greeks(in).delta; }
